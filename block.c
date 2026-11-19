@@ -1,3 +1,7 @@
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include "helpers.h"
 #include "block.h"
 
 void compute_hash(const Block *block, uint8_t* output) {
@@ -12,9 +16,16 @@ void compute_hash(const Block *block, uint8_t* output) {
 
 Block create_genesis_block(void) {
     Block genesis = {0};
-    genesis.index = 0;
-    memset(genesis.prev_hash, 0, SHA256_DIGEST_LENGTH);
     genesis.timestamp = time(NULL);
     compute_hash(&genesis, genesis.hash);
     return genesis;
+}
+
+Block append_block(const Block *prev) {
+    Block next = {0};
+    next.timestamp = time(NULL);
+    next.index = prev->index + 1;
+    memcpy(next.prev_hash, prev->hash, SHA256_DIGEST_LENGTH);
+    compute_hash(&next, next.hash);
+    return next;
 }
