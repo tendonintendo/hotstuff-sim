@@ -21,7 +21,7 @@ Block create_genesis_block(void) {
     return genesis;
 }
 
-Block append_block(const Block *prev) {
+Block make_block(const Block *prev) {
     Block next = {0};
     next.timestamp = time(NULL);
     next.index = prev->index + 1;

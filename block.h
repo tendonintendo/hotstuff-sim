@@ -15,6 +15,6 @@ typedef struct {
 
 void compute_hash(const Block *block, uint8_t* output);
 Block create_genesis_block(void);
-Block append_block(const Block *block);
+Block make_block(const Block *prev);
 
 #endif

@@ -1,4 +1,4 @@
-day 1: creating init block struct and genesis function
+day 1: creating init block struct and genesis function; verifying chain of hash
 - use the stack when the size is fixed and the data only lives inside one function
 - use malloc when the size is dynamic or the data must outlive the function, and decide who frees it
 - SHA256 writes the digest to output buffer
@@ -7,3 +7,5 @@ day 1: creating init block struct and genesis function
 - pointers avoid copying. pass large structs you only read as const T *, pass small things by value, and returning a struct by value is fine.
 - since the hash is an array of bytes (8 bits), printing to hex requires two hex digits and the string requires size of 2n + 1
 - encoding of a block must be injective: different blocks must always produce different byte strings.
+- free heap data (malloc/realloc)
+- check NULL after malloc/realloc is good practice

@@ -4,7 +4,7 @@ LDFLAGS =
 LDLIBS  = -lcrypto
 
 TARGET = hotstuff-sim
-SRCS   = main.c block.c helpers.c
+SRCS   = main.c block.c helpers.c chain.c
 OBJS   = $(SRCS:%.c=bin/%.o)
 DEPS   = $(OBJS:.o=.d)
 
@@ -14,6 +14,7 @@ $(TARGET): $(OBJS)
 		$(CC) $(LDFLAGS) $^ -o $@ $(LDLIBS)
 
 bin/%.o: %.c
+		mkdir -p $(@D)
 		$(CC) $(CFLAGS) -c $< -o $@
 
 asan: clean
