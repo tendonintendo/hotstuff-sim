@@ -9,3 +9,7 @@ day 1: creating init block struct and genesis function; verifying chain of hash
 - encoding of a block must be injective: different blocks must always produce different byte strings.
 - free heap data (malloc/realloc)
 - check NULL after malloc/realloc is good practice
+
+day 2: transactions and signatures
+- writing byte by byte in loop for uint byte difference
+- macros need outer parentheses to reduce risk of bugs
