@@ -35,12 +35,17 @@ void tx_hash(const Tx *tx, uint8_t out[HASH_LEN]) {
 }
 
 TxResult tx_encode(Buf *out, const Tx *tx) {
-    if(put_bytes(out, tx->from, crypto_sign_PUBLICKEYBYTES)) return TX_ERR_FULL;
-    if(put_bytes(out, tx->to, crypto_sign_PUBLICKEYBYTES)) return TX_ERR_FULL;
-    if(put_u64_le(out, tx->amount)) return TX_ERR_FULL;
-    if(put_u64_le(out, tx->nonce)) return TX_ERR_FULL;
-    if(put_bytes(out, tx->sig, crypto_sign_BYTES)) return TX_ERR_FULL;
+    size_t len = out->len;
+    if(put_bytes(out, tx->from, crypto_sign_PUBLICKEYBYTES))  goto fail;
+    if(put_bytes(out, tx->to, crypto_sign_PUBLICKEYBYTES)) goto fail;
+    if(put_u64_le(out, tx->amount)) goto fail;
+    if(put_u64_le(out, tx->nonce)) goto fail;
+    if(put_bytes(out, tx->sig, crypto_sign_BYTES)) goto fail;
     return TX_OK;
+
+fail:
+    out->len = len;
+    return TX_ERR_FULL;
 }
 
 TxResult tx_decode(Tx *out, Reader *r) {

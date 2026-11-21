@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../block.h"
 #include "../chain.h"
@@ -1142,6 +1143,329 @@ static void test_encode_result_str(void) {
     CHECK(strcmp(encode_result_str(ENC_ERR_FULL), encode_result_str(ENC_ERR_TRUNCATED)) != 0);
 }
 
+/* Builds a signed tx with distinctive amount and nonce bytes, for layout checks. */
+static Tx layout_tx(const Keys *from, const Keys *to) {
+    return signed_tx_nonce(from, to, 1000, 0x0102030405060708ULL);
+}
+
+/* An encoded tx is 144 bytes: from, to, amount LE, nonce LE, sig. */
+static void test_tx_encode_layout(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx tx = layout_tx(&alice, &bob);
+    uint8_t storage[TX_ENC_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(tx_encode(&b, &tx) == TX_OK);
+    CHECK(b.len == TX_ENC_LEN);
+    CHECK(b.len == 144);
+    CHECK(memcmp(storage, tx.from, 32) == 0);
+    CHECK(memcmp(storage + 32, tx.to, 32) == 0);
+    const uint8_t amount[8] = {0xE8, 0x03, 0, 0, 0, 0, 0, 0};
+    const uint8_t nonce[8] = {0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01};
+    CHECK(memcmp(storage + 64, amount, 8) == 0);
+    CHECK(memcmp(storage + 72, nonce, 8) == 0);
+    CHECK(memcmp(storage + 80, tx.sig, 64) == 0);
+}
+
+/* A decoded tx equals the original, still verifies, and hashes the same. */
+static void test_tx_roundtrip(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx tx = layout_tx(&alice, &bob);
+    uint8_t storage[TX_ENC_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(tx_encode(&b, &tx) == TX_OK);
+
+    Reader r = init_enc_reader(storage, b.len);
+    Tx got;
+    memset(&got, 0xAA, sizeof(got));
+    CHECK(tx_decode(&got, &r) == TX_OK);
+    CHECK(r.offset == TX_ENC_LEN);
+    CHECK(memcmp(got.from, tx.from, sizeof(tx.from)) == 0);
+    CHECK(memcmp(got.to, tx.to, sizeof(tx.to)) == 0);
+    CHECK(got.amount == tx.amount);
+    CHECK(got.nonce == tx.nonce);
+    CHECK(memcmp(got.sig, tx.sig, sizeof(tx.sig)) == 0);
+    CHECK(tx_verify(&got) == TX_OK);
+
+    uint8_t h1[HASH_LEN], h2[HASH_LEN];
+    tx_hash(&tx, h1);
+    tx_hash(&got, h2);
+    CHECK(memcmp(h1, h2, HASH_LEN) == 0);
+}
+
+/* Several txs encoded back to back decode in order from one reader. */
+static void test_tx_roundtrip_sequence(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx txs[MAX_TXS];
+    make_txs(txs, 3, &alice, &bob);
+    uint8_t storage[3 * TX_ENC_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    int enc_ok = 1;
+    for (size_t i = 0; i < 3; i++) {
+        if (tx_encode(&b, &txs[i]) != TX_OK) enc_ok = 0;
+    }
+    CHECK(enc_ok);
+    CHECK(b.len == 3 * TX_ENC_LEN);
+
+    Reader r = init_enc_reader(storage, b.len);
+    int dec_ok = 1;
+    for (size_t i = 0; i < 3; i++) {
+        Tx got;
+        if (tx_decode(&got, &r) != TX_OK || got.nonce != txs[i].nonce ||
+            got.amount != txs[i].amount || tx_verify(&got) != TX_OK) dec_ok = 0;
+    }
+    CHECK(dec_ok);
+    Tx extra;
+    CHECK(tx_decode(&extra, &r) == TX_ERR_TRUNCATED);
+}
+
+/* Encoding into any capacity below 144 bytes reports a full buffer and writes nothing. */
+static void test_tx_encode_full(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx tx = layout_tx(&alice, &bob);
+    uint8_t storage[TX_ENC_LEN];
+    int all_full = 1;
+    for (size_t cap = 0; cap < TX_ENC_LEN; cap++) {
+        Buf b = init_enc_buf(storage, cap);
+        if (tx_encode(&b, &tx) != TX_ERR_FULL) all_full = 0;
+        if (b.len != 0) all_full = 0;
+    }
+    CHECK(all_full);
+}
+
+/* A tx that does not fit after earlier data rolls back to where it started, keeping the earlier data. */
+static void test_tx_encode_full_rolls_back_to_start(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx tx = layout_tx(&alice, &bob);
+    uint8_t storage[TX_ENC_LEN + 100];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(tx_encode(&b, &tx) == TX_OK);
+    CHECK(tx_encode(&b, &tx) == TX_ERR_FULL);
+    CHECK(b.len == TX_ENC_LEN);
+
+    Reader r = init_enc_reader(storage, b.len);
+    Tx got;
+    CHECK(tx_decode(&got, &r) == TX_OK);
+    CHECK(tx_verify(&got) == TX_OK);
+}
+
+/* Every truncated encoding, 0 to 143 bytes, is rejected without reading past the input. */
+static void test_tx_decode_every_prefix_truncated(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx tx = layout_tx(&alice, &bob);
+    uint8_t storage[TX_ENC_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(tx_encode(&b, &tx) == TX_OK);
+
+    int all_truncated = 1;
+    for (size_t n = 0; n < TX_ENC_LEN; n++) {
+        uint8_t *exact = malloc(n ? n : 1);
+        memcpy(exact, storage, n);
+        Reader r = init_enc_reader(exact, n);
+        Tx got;
+        if (tx_decode(&got, &r) != TX_ERR_TRUNCATED) all_truncated = 0;
+        if (r.offset > n) all_truncated = 0;
+        free(exact);
+    }
+    CHECK(all_truncated);
+}
+
+/* Decoding parses bytes only: a tampered signature decodes but then fails verification. */
+static void test_tx_decode_does_not_verify(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx tx = layout_tx(&alice, &bob);
+    uint8_t storage[TX_ENC_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(tx_encode(&b, &tx) == TX_OK);
+    storage[100] ^= 0x01;
+
+    Reader r = init_enc_reader(storage, b.len);
+    Tx got;
+    CHECK(tx_decode(&got, &r) == TX_OK);
+    CHECK(tx_verify(&got) == TX_ERR_BAD_SIG);
+}
+
+/* Builds a block with distinctive field bytes, for layout checks. */
+static Block layout_block(void) {
+    Block blk = {0};
+    blk.index = 5;
+    blk.timestamp = 1000;
+    for (size_t i = 0; i < HASH_LEN; i++) {
+        blk.prev_hash[i] = (uint8_t)i;
+        blk.tx_root[i] = (uint8_t)(0xFF - i);
+    }
+    compute_hash(&blk, blk.hash);
+    return blk;
+}
+
+/* An encoded header is 80 bytes: index LE, timestamp LE, prev_hash, tx_root. */
+static void test_block_encode_layout(void) {
+    Block blk = layout_block();
+    uint8_t storage[BLOCK_HEADER_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+    CHECK(b.len == BLOCK_HEADER_LEN);
+    CHECK(b.len == 80);
+    const uint8_t index[8] = {5, 0, 0, 0, 0, 0, 0, 0};
+    const uint8_t ts[8] = {0xE8, 0x03, 0, 0, 0, 0, 0, 0};
+    CHECK(memcmp(storage, index, 8) == 0);
+    CHECK(memcmp(storage + 8, ts, 8) == 0);
+    CHECK(memcmp(storage + 16, blk.prev_hash, HASH_LEN) == 0);
+    CHECK(memcmp(storage + 48, blk.tx_root, HASH_LEN) == 0);
+}
+
+/* The stored hash is not part of the encoding. */
+static void test_block_encode_excludes_hash(void) {
+    Block blk = layout_block();
+    uint8_t s1[BLOCK_HEADER_LEN], s2[BLOCK_HEADER_LEN];
+    Buf b1 = init_enc_buf(s1, sizeof(s1));
+    CHECK(block_encode(&b1, &blk) == BLOCK_OK);
+    memset(blk.hash, 0x5A, HASH_LEN);
+    Buf b2 = init_enc_buf(s2, sizeof(s2));
+    CHECK(block_encode(&b2, &blk) == BLOCK_OK);
+    CHECK(memcmp(s1, s2, BLOCK_HEADER_LEN) == 0);
+}
+
+/* The block hash is exactly SHA-256 of the encoded header. */
+static void test_block_hash_is_hash_of_encoding(void) {
+    Block blk = layout_block();
+    uint8_t storage[BLOCK_HEADER_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+    uint8_t h[HASH_LEN];
+    hash_bytes(h, storage, b.len);
+    CHECK(memcmp(h, blk.hash, HASH_LEN) == 0);
+}
+
+/* A real block with txs survives encode/decode with every field and the hash intact. */
+static void test_block_roundtrip(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx txs[MAX_TXS];
+    make_txs(txs, 5, &alice, &bob);
+    Block genesis = create_genesis_block();
+    Block blk;
+    CHECK(make_block(&genesis, txs, 5, &blk) == BLOCK_OK);
+
+    uint8_t storage[BLOCK_HEADER_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+
+    Reader r = init_enc_reader(storage, b.len);
+    Block got;
+    memset(&got, 0xAA, sizeof(got));
+    CHECK(block_decode(&got, &r) == BLOCK_OK);
+    CHECK(r.offset == BLOCK_HEADER_LEN);
+    CHECK(got.index == blk.index);
+    CHECK(got.timestamp == blk.timestamp);
+    CHECK(memcmp(got.prev_hash, blk.prev_hash, HASH_LEN) == 0);
+    CHECK(memcmp(got.tx_root, blk.tx_root, HASH_LEN) == 0);
+    CHECK(memcmp(got.hash, blk.hash, HASH_LEN) == 0);
+}
+
+/* Decoding recomputes the hash, so changing any header byte changes the decoded hash. */
+static void test_block_decode_recomputes_hash(void) {
+    Block blk = layout_block();
+    uint8_t storage[BLOCK_HEADER_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+
+    int all_differ = 1;
+    for (size_t i = 0; i < BLOCK_HEADER_LEN; i++) {
+        uint8_t tampered[BLOCK_HEADER_LEN];
+        memcpy(tampered, storage, sizeof(tampered));
+        tampered[i] ^= 0x01;
+        Reader r = init_enc_reader(tampered, sizeof(tampered));
+        Block got;
+        if (block_decode(&got, &r) != BLOCK_OK) all_differ = 0;
+        if (memcmp(got.hash, blk.hash, HASH_LEN) == 0) all_differ = 0;
+    }
+    CHECK(all_differ);
+}
+
+/* Encoding a header into any capacity below 80 bytes reports a full buffer and writes nothing. */
+static void test_block_encode_full(void) {
+    Block blk = layout_block();
+    uint8_t storage[BLOCK_HEADER_LEN];
+    int all_full = 1;
+    for (size_t cap = 0; cap < BLOCK_HEADER_LEN; cap++) {
+        Buf b = init_enc_buf(storage, cap);
+        if (block_encode(&b, &blk) != BLOCK_ERR_FULL) all_full = 0;
+        if (b.len != 0) all_full = 0;
+    }
+    CHECK(all_full);
+}
+
+/* A header that does not fit after earlier data rolls back to where it started. */
+static void test_block_encode_full_rolls_back_to_start(void) {
+    Block blk = layout_block();
+    uint8_t storage[BLOCK_HEADER_LEN + 40];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+    CHECK(block_encode(&b, &blk) == BLOCK_ERR_FULL);
+    CHECK(b.len == BLOCK_HEADER_LEN);
+}
+
+/* Every truncated header, 0 to 79 bytes, is rejected and leaves the output block untouched. */
+static void test_block_decode_every_prefix_truncated(void) {
+    Block blk = layout_block();
+    uint8_t storage[BLOCK_HEADER_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+
+    Block sentinel;
+    memset(&sentinel, 0xAA, sizeof(sentinel));
+    int all_truncated = 1;
+    int untouched = 1;
+    for (size_t n = 0; n < BLOCK_HEADER_LEN; n++) {
+        uint8_t *exact = malloc(n ? n : 1);
+        memcpy(exact, storage, n);
+        Reader r = init_enc_reader(exact, n);
+        Block got = sentinel;
+        if (block_decode(&got, &r) != BLOCK_ERR_TRUNCATED) all_truncated = 0;
+        if (memcmp(&got, &sentinel, sizeof(got)) != 0) untouched = 0;
+        free(exact);
+    }
+    CHECK(all_truncated);
+    CHECK(untouched);
+}
+
+/* 10k random inputs of random length decode cleanly: only ok or truncated, never past the end. */
+static void test_decode_random_bytes(void) {
+    int tx_clean = 1, block_clean = 1;
+    for (int iter = 0; iter < 10000; iter++) {
+        size_t n = randombytes_uniform(3 * TX_ENC_LEN);
+        uint8_t *input = malloc(n ? n : 1);
+        randombytes_buf(input, n);
+
+        Reader rt = init_enc_reader(input, n);
+        TxResult tr;
+        Tx tx;
+        while ((tr = tx_decode(&tx, &rt)) == TX_OK) {}
+        if (tr != TX_ERR_TRUNCATED || rt.offset > n) tx_clean = 0;
+
+        Reader rb = init_enc_reader(input, n);
+        Block blk;
+        BlockResult br = block_decode(&blk, &rb);
+        if (n >= BLOCK_HEADER_LEN) {
+            if (br != BLOCK_OK || rb.offset != BLOCK_HEADER_LEN) block_clean = 0;
+        } else {
+            if (br != BLOCK_ERR_TRUNCATED || rb.offset > n) block_clean = 0;
+        }
+        free(input);
+    }
+    CHECK(tx_clean);
+    CHECK(block_clean);
+}
+
+/* Every new tx and block result has its own name. */
+static void test_tx_block_result_str(void) {
+    CHECK(strcmp(tx_result_str(TX_OK), "unknown result") != 0);
+    CHECK(strcmp(tx_result_str(TX_ERR_BAD_SIG), "unknown result") != 0);
+    CHECK(strcmp(tx_result_str(TX_ERR_FULL), "unknown result") != 0);
+    CHECK(strcmp(tx_result_str(TX_ERR_TRUNCATED), "unknown result") != 0);
+    CHECK(strcmp(block_result_str(BLOCK_ERR_FULL), "unknown result") != 0);
+    CHECK(strcmp(block_result_str(BLOCK_ERR_TRUNCATED), "unknown result") != 0);
+}
+
 int main(void) {
     if(sodium_init() == -1) {
         printf("ERROR: SODIUM INIT FAILURE\n");
@@ -1233,6 +1557,24 @@ int main(void) {
     test_get_u64_le_truncated();
     test_mixed_roundtrip();
     test_encode_result_str();
+
+    test_tx_encode_layout();
+    test_tx_roundtrip();
+    test_tx_roundtrip_sequence();
+    test_tx_encode_full();
+    test_tx_encode_full_rolls_back_to_start();
+    test_tx_decode_every_prefix_truncated();
+    test_tx_decode_does_not_verify();
+    test_block_encode_layout();
+    test_block_encode_excludes_hash();
+    test_block_hash_is_hash_of_encoding();
+    test_block_roundtrip();
+    test_block_decode_recomputes_hash();
+    test_block_encode_full();
+    test_block_encode_full_rolls_back_to_start();
+    test_block_decode_every_prefix_truncated();
+    test_decode_random_bytes();
+    test_tx_block_result_str();
 
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures != 0;

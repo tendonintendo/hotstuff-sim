@@ -49,11 +49,16 @@ void print_block(const Block *block) {
 }
 
 BlockResult block_encode(Buf *buf, const Block *b) {
-    if(put_u64_le(buf, (uint64_t)b->index)) return BLOCK_ERR_FULL;
-    if(put_u64_le(buf, (uint64_t)b->timestamp)) return BLOCK_ERR_FULL;
-    if(put_bytes(buf, b->prev_hash, HASH_LEN)) return BLOCK_ERR_FULL;
-    if(put_bytes(buf, b->tx_root, HASH_LEN)) return BLOCK_ERR_FULL;
+    size_t len = buf->len;
+    if(put_u64_le(buf, (uint64_t)b->index)) goto fail;
+    if(put_u64_le(buf, (uint64_t)b->timestamp)) goto fail;
+    if(put_bytes(buf, b->prev_hash, HASH_LEN)) goto fail;
+    if(put_bytes(buf, b->tx_root, HASH_LEN)) goto fail;
     return BLOCK_OK;
+
+fail:
+    buf->len = len;
+    return BLOCK_ERR_FULL;
 }
 
 BlockResult block_decode(Block *out, Reader *r) {
