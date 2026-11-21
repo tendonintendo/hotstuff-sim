@@ -24,7 +24,7 @@ StateResult state_add(State *state, const uint8_t pk[crypto_sign_PUBLICKEYBYTES]
 }
 
 StateResult state_apply_tx(State *state, const Tx *tx) {
-    if(!tx_verify(tx)) return STATE_ERR_BAD_SIG;
+    if(tx_verify(tx)) return STATE_ERR_BAD_SIG;
     Account* from = state_lookup(state, tx->from);
     Account* to = state_lookup(state, tx->to);
     if(from == NULL) return STATE_ERR_UNKNOWN_SENDER;

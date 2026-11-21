@@ -212,7 +212,7 @@ static Tx signed_tx(const Keys *from, const Keys *to, uint64_t amount) {
 static void test_tx_valid(void) {
     Keys alice = new_account(), bob = new_account();
     Tx tx = signed_tx(&alice, &bob, 100);
-    CHECK(tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_OK);
 }
 
 /* Ed25519 is deterministic: signing the same tx twice gives the same signature. */
@@ -228,7 +228,7 @@ static void test_tx_tamper_amount(void) {
     Keys alice = new_account(), bob = new_account();
     Tx tx = signed_tx(&alice, &bob, 100);
     tx.amount = 1000000;
-    CHECK(!tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_ERR_BAD_SIG);
 }
 
 /* Every one of the amount's 8 bytes is covered by the signature. */
@@ -239,7 +239,7 @@ static void test_tx_amount_every_byte_signed(void) {
     for (int i = 0; i < 8; i++) {
         Tx t = tx;
         t.amount ^= (uint64_t)1 << (8 * i);
-        if (tx_verify(&t)) all_caught = 0;
+        if (tx_verify(&t) == TX_OK) all_caught = 0;
     }
     CHECK(all_caught);
 }
@@ -249,7 +249,7 @@ static void test_tx_tamper_to(void) {
     Keys alice = new_account(), bob = new_account(), mallory = new_account();
     Tx tx = signed_tx(&alice, &bob, 100);
     memcpy(tx.to, mallory.pk, sizeof(tx.to));
-    CHECK(!tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_ERR_BAD_SIG);
 }
 
 /* Claiming a different sender breaks the signature. */
@@ -257,7 +257,7 @@ static void test_tx_tamper_from(void) {
     Keys alice = new_account(), bob = new_account(), carol = new_account();
     Tx tx = signed_tx(&alice, &bob, 100);
     memcpy(tx.from, carol.pk, sizeof(tx.from));
-    CHECK(!tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_ERR_BAD_SIG);
 }
 
 /* Flipping a single bit of the signature makes it invalid. */
@@ -265,7 +265,7 @@ static void test_tx_tamper_sig(void) {
     Keys alice = new_account(), bob = new_account();
     Tx tx = signed_tx(&alice, &bob, 100);
     tx.sig[0] ^= 1;
-    CHECK(!tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_ERR_BAD_SIG);
 }
 
 /* Signing with a key that does not own the from address fails verification. */
@@ -276,13 +276,13 @@ static void test_tx_wrong_key(void) {
     memcpy(tx.to, bob.pk, sizeof(tx.to));
     tx.amount = 100;
     tx_sign(&tx, mallory.sk);
-    CHECK(!tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_ERR_BAD_SIG);
 }
 
 /* An all-zero, never-signed tx is rejected. */
 static void test_tx_unsigned(void) {
     Tx tx = {0};
-    CHECK(!tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_ERR_BAD_SIG);
 }
 
 /* Builds a state holding alice and bob with the given starting balances. */
@@ -499,7 +499,7 @@ static void test_tx_tamper_nonce(void) {
     Keys alice = new_account(), bob = new_account();
     Tx tx = signed_tx(&alice, &bob, 30);
     tx.nonce = 1;
-    CHECK(!tx_verify(&tx));
+    CHECK(tx_verify(&tx) == TX_ERR_BAD_SIG);
 }
 
 /* Every one of the nonce's 8 bytes is covered by the signature. */
@@ -510,7 +510,7 @@ static void test_tx_nonce_every_byte_signed(void) {
     for (int i = 0; i < 8; i++) {
         Tx t = tx;
         t.nonce ^= (uint64_t)1 << (8 * i);
-        if (tx_verify(&t)) all_caught = 0;
+        if (tx_verify(&t) == TX_OK) all_caught = 0;
     }
     CHECK(all_caught);
 }

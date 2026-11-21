@@ -7,6 +7,9 @@
 #include <sodium.h>
 #include "hash.h"
 #include "tx.h"
+#include "encode.h"
+
+#define BLOCK_HEADER_LEN 80
 
 typedef struct {
     long long index;
@@ -18,7 +21,9 @@ typedef struct {
 
 typedef enum {
     BLOCK_OK = 0,
-    BLOCK_ERR_TOO_MANY_TXS
+    BLOCK_ERR_TOO_MANY_TXS,
+    BLOCK_ERR_FULL,
+    BLOCK_ERR_TRUNCATED
 } BlockResult;
 
 const char *block_result_str(BlockResult result);
@@ -28,4 +33,6 @@ Block create_genesis_block(void);
 BlockResult make_block(const Block *prev, const Tx txs[MAX_TXS], const size_t cnt, Block *out);
 void print_block(const Block *block);
 
+BlockResult block_encode(Buf *out, const Block *b);
+BlockResult block_decode(Block *out, Reader *r);
 #endif

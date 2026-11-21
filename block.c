@@ -9,15 +9,10 @@
 _Static_assert(MAX_TXS <= MERKLE_MAX_LEAVES, "MAX_TXS must fit in one Merkle tree");
 
 void compute_hash(const Block *block, uint8_t* output) {
-    char payload[512];
-    char prev_hash_hex[(HASH_LEN << 1) + 1];
-    char tx_root_hex[(HASH_LEN << 1) + 1];
-    to_hex(block->prev_hash, HASH_LEN, prev_hash_hex);
-    to_hex(block->tx_root, HASH_LEN, tx_root_hex);
-    snprintf(payload, sizeof(payload), "INDEX=%lld|TIMESTAMP=%lld|PREV_HASH=%s|TX_ROOT=%s", 
-            block->index, (long long)block->timestamp, prev_hash_hex, tx_root_hex);
-
-    hash_bytes(output, (unsigned char*)payload, strlen(payload));
+    uint8_t header[BLOCK_HEADER_LEN];
+    Buf buf = init_enc_buf(header, BLOCK_HEADER_LEN);
+    block_encode(&buf, block);
+    hash_bytes(output, header, buf.len);
 }
 
 Block create_genesis_block(void) {
@@ -53,10 +48,34 @@ void print_block(const Block *block) {
 
 }
 
+BlockResult block_encode(Buf *buf, const Block *b) {
+    if(put_u64_le(buf, (uint64_t)b->index)) return BLOCK_ERR_FULL;
+    if(put_u64_le(buf, (uint64_t)b->timestamp)) return BLOCK_ERR_FULL;
+    if(put_bytes(buf, b->prev_hash, HASH_LEN)) return BLOCK_ERR_FULL;
+    if(put_bytes(buf, b->tx_root, HASH_LEN)) return BLOCK_ERR_FULL;
+    return BLOCK_OK;
+}
+
+BlockResult block_decode(Block *out, Reader *r) {
+    Block tmp = {0};
+    uint64_t index, timestamp;
+    if(get_u64_le(&index, r)) return BLOCK_ERR_TRUNCATED;
+    if(get_u64_le(&timestamp, r)) return BLOCK_ERR_TRUNCATED;
+    if(get_bytes(tmp.prev_hash, r, HASH_LEN)) return BLOCK_ERR_TRUNCATED;
+    if(get_bytes(tmp.tx_root, r, HASH_LEN)) return BLOCK_ERR_TRUNCATED;
+    tmp.index = (long long)index;
+    tmp.timestamp = (time_t)timestamp;
+    compute_hash(&tmp, tmp.hash);
+    *out = tmp;
+    return BLOCK_OK;
+}
+
 const char *block_result_str(BlockResult result) {
     switch (result) {
     case BLOCK_OK:               return "ok";
     case BLOCK_ERR_TOO_MANY_TXS: return "too many transactions";
+    case BLOCK_ERR_FULL:         return "buffer full";
+    case BLOCK_ERR_TRUNCATED:    return "truncated input";
     }
     return "unknown result";
 }
