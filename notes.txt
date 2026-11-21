@@ -10,6 +10,11 @@ day 1: creating init block struct and genesis function; verifying chain of hash
 - free heap data (malloc/realloc)
 - check NULL after malloc/realloc is good practice
 
-day 2: transactions and signatures
-- writing byte by byte in loop for uint byte difference
+day 2: transactions and signatures, merkle trees, and state
+- writing byte by byte in loop for uint byte difference. endianness
 - macros need outer parentheses to reduce risk of bugs
+- carry over odd nodes to i / 2 to achieve H(H(ab)|H(c)) as opposed to H(H(ab) | H(cc)). duplicating the last leaf when nodes are odd causes [a,b,c] and [a,b,c,c] to get the same root (CVE-2012-2459)
+- nonce avoids replay attacks (the same transaction being ran multiple times) and state_apply_tx will only accept when tx.nonce == account.nonce. nonce is covered by the signature and thus cannot be forged
+- domain separation, add distinct byte prefixes (0x00 for leaves and 0x01 for nodes) to hash so that each hash has its own roles. without it an internal node can be passed of as a leaf, which forges a Merkle proof.
+
+day 3: encoding
