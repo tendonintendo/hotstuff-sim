@@ -3,6 +3,8 @@ CFLAGS  = -std=c11 -Wall -Wextra -Werror -g -MMD -MP
 LDFLAGS =
 LDLIBS  = -lsodium
 ASAN    = -fsanitize=address -fno-omit-frame-pointer
+NVCC    = nvcc
+NVFLAGS = -arch=sm_120 -O2
 
 BUILD  = bin
 TARGET = hotstuff-sim
@@ -35,9 +37,15 @@ asan:
 test-asan:
 		$(MAKE) test BUILD=bin/asan CFLAGS="$(CFLAGS) $(ASAN)" LDFLAGS="-fsanitize=address"
 
+cuda: $(BUILD)/vecadd
+
+$(BUILD)/vecadd: cuda/vecadd.cu
+		mkdir -p $(@D)
+		$(NVCC) $(NVFLAGS) $< -o $@
+
 clean:
 		rm -rf bin/ $(TARGET)
 
 -include $(DEPS)
 
-.PHONY: all asan clean test test-asan
+.PHONY: all asan clean cuda test test-asan
