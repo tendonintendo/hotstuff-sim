@@ -6,7 +6,7 @@ ASAN    = -fsanitize=address -fno-omit-frame-pointer
 
 BUILD  = bin
 TARGET = hotstuff-sim
-SRCS   = main.c block.c helpers.c chain.c tx.c state.c merkle.c encode.c
+SRCS   = main.c block.c helpers.c chain.c tx.c state.c merkle.c encode.c prng.c event.c sim.c node.c
 OBJS   = $(SRCS:%.c=$(BUILD)/%.o)
 TEST_SRCS = tests/test_main.c
 TEST_OBJS = $(TEST_SRCS:%.c=$(BUILD)/%.o) $(filter-out $(BUILD)/main.o,$(OBJS))

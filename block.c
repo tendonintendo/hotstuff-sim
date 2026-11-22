@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -43,15 +44,15 @@ void print_block(const Block *block) {
     to_hex(block->hash, HASH_LEN, hash_hex);
     char prev_hash_hex[(HASH_LEN << 1) + 1];
     to_hex(block->prev_hash, HASH_LEN, prev_hash_hex);
-    printf("INDEX=%lld|TIMESTAMP=%lld|HASH=%s|PREV_HASH=%s\n", 
-            block->index, (long long)block->timestamp, hash_hex, prev_hash_hex);
+    printf("INDEX=%" PRIu64 "|TIMESTAMP=%" PRIu64 "|HASH=%s|PREV_HASH=%s\n",
+            block->index, block->timestamp, hash_hex, prev_hash_hex);
 
 }
 
 BlockResult block_encode(Buf *buf, const Block *b) {
     size_t len = buf->len;
-    if(put_u64_le(buf, (uint64_t)b->index)) goto fail;
-    if(put_u64_le(buf, (uint64_t)b->timestamp)) goto fail;
+    if(put_u64_le(buf, b->index)) goto fail;
+    if(put_u64_le(buf, b->timestamp)) goto fail;
     if(put_bytes(buf, b->prev_hash, HASH_LEN)) goto fail;
     if(put_bytes(buf, b->tx_root, HASH_LEN)) goto fail;
     return BLOCK_OK;
@@ -63,16 +64,17 @@ fail:
 
 BlockResult block_decode(Block *out, Reader *r) {
     Block tmp = {0};
-    uint64_t index, timestamp;
-    if(get_u64_le(&index, r)) return BLOCK_ERR_TRUNCATED;
-    if(get_u64_le(&timestamp, r)) return BLOCK_ERR_TRUNCATED;
-    if(get_bytes(tmp.prev_hash, r, HASH_LEN)) return BLOCK_ERR_TRUNCATED;
-    if(get_bytes(tmp.tx_root, r, HASH_LEN)) return BLOCK_ERR_TRUNCATED;
-    tmp.index = (long long)index;
-    tmp.timestamp = (time_t)timestamp;
+    uint8_t offset = r->offset;
+    if(get_u64_le(&tmp.index, r)) goto fail;
+    if(get_u64_le(&tmp.timestamp, r)) goto fail;
+    if(get_bytes(tmp.prev_hash, r, HASH_LEN)) goto fail;
+    if(get_bytes(tmp.tx_root, r, HASH_LEN)) goto fail;
     compute_hash(&tmp, tmp.hash);
     *out = tmp;
     return BLOCK_OK;
+fail:
+    r->offset = offset;
+    return BLOCK_ERR_TRUNCATED;
 }
 
 const char *block_result_str(BlockResult result) {

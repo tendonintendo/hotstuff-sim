@@ -12,8 +12,8 @@
 #define BLOCK_HEADER_LEN 80
 
 typedef struct {
-    long long index;
-    time_t timestamp;
+    uint64_t index;
+    uint64_t timestamp;
     uint8_t hash[HASH_LEN];
     uint8_t prev_hash[HASH_LEN];
     uint8_t tx_root[HASH_LEN];

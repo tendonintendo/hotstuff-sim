@@ -7,6 +7,9 @@
 #include "../state.h"
 #include "../merkle.h"
 #include "../encode.h"
+#include "../prng.h"
+#include "../event.h"
+#include "../sim.h"
 
 static int checks = 0;
 static int failures = 0;
@@ -97,7 +100,7 @@ static void test_growth(void) {
 
     int sequential = 1;
     for (size_t i = 0; i < bc.len; i++) {
-        if (bc.blocks[i].index != (long long)i) sequential = 0;
+        if (bc.blocks[i].index != (uint64_t)i) sequential = 0;
     }
     CHECK(sequential);
     CHECK(validate_chain(&bc) == CHAIN_OK);
@@ -1248,7 +1251,7 @@ static void test_tx_encode_full_rolls_back_to_start(void) {
     CHECK(tx_verify(&got) == TX_OK);
 }
 
-/* Every truncated encoding, 0 to 143 bytes, is rejected without reading past the input. */
+/* Every truncated encoding, 0 to 143 bytes, is rejected and leaves the reader and output untouched. */
 static void test_tx_decode_every_prefix_truncated(void) {
     Keys alice = new_account(), bob = new_account();
     Tx tx = layout_tx(&alice, &bob);
@@ -1256,17 +1259,43 @@ static void test_tx_decode_every_prefix_truncated(void) {
     Buf b = init_enc_buf(storage, sizeof(storage));
     CHECK(tx_encode(&b, &tx) == TX_OK);
 
+    Tx sentinel;
+    memset(&sentinel, 0xAA, sizeof(sentinel));
     int all_truncated = 1;
+    int offset_restored = 1;
+    int untouched = 1;
     for (size_t n = 0; n < TX_ENC_LEN; n++) {
         uint8_t *exact = malloc(n ? n : 1);
         memcpy(exact, storage, n);
         Reader r = init_enc_reader(exact, n);
-        Tx got;
+        Tx got = sentinel;
         if (tx_decode(&got, &r) != TX_ERR_TRUNCATED) all_truncated = 0;
-        if (r.offset > n) all_truncated = 0;
+        if (r.offset != 0) offset_restored = 0;
+        if (memcmp(&got, &sentinel, sizeof(got)) != 0) untouched = 0;
         free(exact);
     }
     CHECK(all_truncated);
+    CHECK(offset_restored);
+    CHECK(untouched);
+}
+
+/* A truncated tx after a valid one leaves the reader at the end of the valid one. */
+static void test_tx_decode_failure_keeps_earlier_progress(void) {
+    Keys alice = new_account(), bob = new_account();
+    Tx tx = layout_tx(&alice, &bob);
+    uint8_t storage[2 * TX_ENC_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(tx_encode(&b, &tx) == TX_OK);
+    CHECK(tx_encode(&b, &tx) == TX_OK);
+
+    Reader r = init_enc_reader(storage, TX_ENC_LEN + 100);
+    Tx first, second;
+    memset(&second, 0xAA, sizeof(second));
+    Tx sentinel = second;
+    CHECK(tx_decode(&first, &r) == TX_OK);
+    CHECK(tx_decode(&second, &r) == TX_ERR_TRUNCATED);
+    CHECK(r.offset == TX_ENC_LEN);
+    CHECK(memcmp(&second, &sentinel, sizeof(second)) == 0);
 }
 
 /* Decoding parses bytes only: a tampered signature decodes but then fails verification. */
@@ -1311,6 +1340,39 @@ static void test_block_encode_layout(void) {
     CHECK(memcmp(storage + 8, ts, 8) == 0);
     CHECK(memcmp(storage + 16, blk.prev_hash, HASH_LEN) == 0);
     CHECK(memcmp(storage + 48, blk.tx_root, HASH_LEN) == 0);
+}
+
+/* Index and timestamp keep all 64 bits through the struct and the encoding. */
+static void test_block_full_width_fields(void) {
+    Block blk = layout_block();
+    blk.index = 0x0102030405060708ULL;
+    blk.timestamp = UINT64_MAX;
+    CHECK(blk.index == 0x0102030405060708ULL);
+    CHECK(blk.timestamp == UINT64_MAX);
+    compute_hash(&blk, blk.hash);
+
+    uint8_t storage[BLOCK_HEADER_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+    const uint8_t index[8] = {0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01};
+    CHECK(memcmp(storage, index, 8) == 0);
+    CHECK(all_bytes_are(storage + 8, 8, 0xFF));
+
+    Reader r = init_enc_reader(storage, b.len);
+    Block got;
+    CHECK(block_decode(&got, &r) == BLOCK_OK);
+    CHECK(got.index == blk.index);
+    CHECK(got.timestamp == blk.timestamp);
+    CHECK(memcmp(got.hash, blk.hash, HASH_LEN) == 0);
+}
+
+/* A chain keeps validating past index 255. */
+static void test_chain_past_255_blocks(void) {
+    Chain bc = build_chain(300);
+    CHECK(bc.len == 300);
+    CHECK(bc.blocks[299].index == 299);
+    CHECK(validate_chain(&bc) == CHAIN_OK);
+    chain_free(&bc);
 }
 
 /* The stored hash is not part of the encoding. */
@@ -1404,7 +1466,7 @@ static void test_block_encode_full_rolls_back_to_start(void) {
     CHECK(b.len == BLOCK_HEADER_LEN);
 }
 
-/* Every truncated header, 0 to 79 bytes, is rejected and leaves the output block untouched. */
+/* Every truncated header, 0 to 79 bytes, is rejected and leaves the reader and output untouched. */
 static void test_block_decode_every_prefix_truncated(void) {
     Block blk = layout_block();
     uint8_t storage[BLOCK_HEADER_LEN];
@@ -1414,6 +1476,7 @@ static void test_block_decode_every_prefix_truncated(void) {
     Block sentinel;
     memset(&sentinel, 0xAA, sizeof(sentinel));
     int all_truncated = 1;
+    int offset_restored = 1;
     int untouched = 1;
     for (size_t n = 0; n < BLOCK_HEADER_LEN; n++) {
         uint8_t *exact = malloc(n ? n : 1);
@@ -1421,11 +1484,28 @@ static void test_block_decode_every_prefix_truncated(void) {
         Reader r = init_enc_reader(exact, n);
         Block got = sentinel;
         if (block_decode(&got, &r) != BLOCK_ERR_TRUNCATED) all_truncated = 0;
+        if (r.offset != 0) offset_restored = 0;
         if (memcmp(&got, &sentinel, sizeof(got)) != 0) untouched = 0;
         free(exact);
     }
     CHECK(all_truncated);
+    CHECK(offset_restored);
     CHECK(untouched);
+}
+
+/* A truncated header after a valid one leaves the reader at the end of the valid one. */
+static void test_block_decode_failure_keeps_earlier_progress(void) {
+    Block blk = layout_block();
+    uint8_t storage[2 * BLOCK_HEADER_LEN];
+    Buf b = init_enc_buf(storage, sizeof(storage));
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+    CHECK(block_encode(&b, &blk) == BLOCK_OK);
+
+    Reader r = init_enc_reader(storage, BLOCK_HEADER_LEN + 50);
+    Block first, second;
+    CHECK(block_decode(&first, &r) == BLOCK_OK);
+    CHECK(block_decode(&second, &r) == BLOCK_ERR_TRUNCATED);
+    CHECK(r.offset == BLOCK_HEADER_LEN);
 }
 
 /* 10k random inputs of random length decode cleanly: only ok or truncated, never past the end. */
@@ -1440,7 +1520,7 @@ static void test_decode_random_bytes(void) {
         TxResult tr;
         Tx tx;
         while ((tr = tx_decode(&tx, &rt)) == TX_OK) {}
-        if (tr != TX_ERR_TRUNCATED || rt.offset > n) tx_clean = 0;
+        if (tr != TX_ERR_TRUNCATED || rt.offset > n || rt.offset % TX_ENC_LEN != 0) tx_clean = 0;
 
         Reader rb = init_enc_reader(input, n);
         Block blk;
@@ -1448,7 +1528,7 @@ static void test_decode_random_bytes(void) {
         if (n >= BLOCK_HEADER_LEN) {
             if (br != BLOCK_OK || rb.offset != BLOCK_HEADER_LEN) block_clean = 0;
         } else {
-            if (br != BLOCK_ERR_TRUNCATED || rb.offset > n) block_clean = 0;
+            if (br != BLOCK_ERR_TRUNCATED || rb.offset != 0) block_clean = 0;
         }
         free(input);
     }
@@ -1464,6 +1544,581 @@ static void test_tx_block_result_str(void) {
     CHECK(strcmp(tx_result_str(TX_ERR_TRUNCATED), "unknown result") != 0);
     CHECK(strcmp(block_result_str(BLOCK_ERR_FULL), "unknown result") != 0);
     CHECK(strcmp(block_result_str(BLOCK_ERR_TRUNCATED), "unknown result") != 0);
+}
+
+/* init records the seed and starts the state at it. */
+static void test_prng_init(void) {
+    PRNG rng = prng_init(42);
+    CHECK(rng.seed == 42);
+    CHECK(rng.state == 42);
+}
+
+/* Seed 0 reproduces the published splitmix64 sequence. */
+static void test_prng_reference_seed_0(void) {
+    const uint64_t want[5] = {0xe220a8397b1dcdafULL, 0x6e789e6aa1b965f4ULL, 0x06c45d188009454fULL,
+                              0xf88bb8a8724c81ecULL, 0x1b39896a51a8749bULL};
+    PRNG rng = prng_init(0);
+    int all_match = 1;
+    for (size_t i = 0; i < 5; i++) {
+        if (prng_next(&rng) != want[i]) all_match = 0;
+    }
+    CHECK(all_match);
+}
+
+/* Seed 1234567 reproduces the reference splitmix64 test vector. */
+static void test_prng_reference_seed_1234567(void) {
+    const uint64_t want[5] = {0x599ed017fb08fc85ULL, 0x2c73f08458540fa5ULL, 0x883ebce5a3f27c77ULL,
+                              0x3fbef740e9177b3fULL, 0xe3b8346708cb5ecdULL};
+    PRNG rng = prng_init(1234567);
+    int all_match = 1;
+    for (size_t i = 0; i < 5; i++) {
+        if (prng_next(&rng) != want[i]) all_match = 0;
+    }
+    CHECK(all_match);
+}
+
+/* The state is a counter: it advances by the golden-ratio constant on every call. */
+static void test_prng_state_is_counter(void) {
+    PRNG rng = prng_init(7);
+    int counts = 1;
+    for (uint64_t i = 1; i <= 100; i++) {
+        prng_next(&rng);
+        if (rng.state != 7 + i * 0x9e3779b97f4a7c15ULL) counts = 0;
+    }
+    CHECK(counts);
+    CHECK(rng.seed == 7);
+}
+
+/* Two generators with the same seed produce the same 10k numbers. */
+static void test_prng_same_seed_same_sequence(void) {
+    PRNG a = prng_init(0xDEADBEEF), b = prng_init(0xDEADBEEF);
+    int same = 1;
+    for (int i = 0; i < 10000; i++) {
+        if (prng_next(&a) != prng_next(&b)) same = 0;
+    }
+    CHECK(same);
+}
+
+/* Different seeds diverge, and generators do not share hidden state. */
+static void test_prng_independent_streams(void) {
+    PRNG a = prng_init(1), b = prng_init(2);
+    CHECK(prng_next(&a) != prng_next(&b));
+
+    PRNG c = prng_init(99), d = prng_init(99);
+    uint64_t first_c = prng_next(&c);
+    for (int i = 0; i < 50; i++) prng_next(&a);
+    CHECK(prng_next(&d) == first_c);
+}
+
+/* Consecutive outputs do not repeat over 10k draws. */
+static void test_prng_no_short_repeats(void) {
+    PRNG rng = prng_init(5);
+    uint64_t prev = prng_next(&rng);
+    int distinct = 1;
+    for (int i = 0; i < 10000; i++) {
+        uint64_t cur = prng_next(&rng);
+        if (cur == prev) distinct = 0;
+        prev = cur;
+    }
+    CHECK(distinct);
+}
+
+/* One heap shared by the heap tests; it is ~96 KB, too big for the stack in every test. */
+static Heap test_heap;
+
+/* Builds an event at the given time with a recognisable payload. */
+static Event ev_at(uint64_t time, uint8_t node) {
+    Event e = {0};
+    e.time = time;
+    e.type = EV_DELIVER;
+    e.from = (uint8_t)(node + 1);
+    e.node = node;
+    e.msg_idx = (uint16_t)(node * 3);
+    return e;
+}
+
+/* True if a should be popped before b: earlier time, then smaller seq. */
+static int ev_earlier(const Event *a, const Event *b) {
+    return a->time < b->time || (a->time == b->time && a->seq < b->seq);
+}
+
+/* True if no child in the heap array comes before its parent. */
+static int heap_property_holds(const Heap *h) {
+    for (size_t i = 1; i < h->size; i++) {
+        if (ev_earlier(&h->events[i], &h->events[(i - 1) / 2])) return 0;
+    }
+    return 1;
+}
+
+/* A fresh heap is empty and starts numbering at 0. */
+static void test_heap_init(void) {
+    Heap *h = &test_heap;
+    h->size = 77;
+    h->next_seq = 77;
+    heap_init(h);
+    CHECK(h->size == 0);
+    CHECK(h->next_seq == 0);
+}
+
+/* Popping an empty heap fails and leaves the output untouched. */
+static void test_heap_pop_empty(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    Event out = ev_at(999, 9);
+    Event before = out;
+    CHECK(heap_pop(&out, h) == HEAP_ERR_EMPTY);
+    CHECK(memcmp(&out, &before, sizeof(out)) == 0);
+    CHECK(h->size == 0);
+}
+
+/* One event goes in and comes out with every field intact. */
+static void test_heap_single(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    Event e = ev_at(42, 3);
+    CHECK(heap_push(h, &e) == HEAP_OK);
+    CHECK(h->size == 1);
+    Event out;
+    CHECK(heap_pop(&out, h) == HEAP_OK);
+    CHECK(h->size == 0);
+    CHECK(out.time == 42);
+    CHECK(out.seq == 0);
+    CHECK(out.type == EV_DELIVER);
+    CHECK(out.from == 4);
+    CHECK(out.node == 3);
+    CHECK(out.msg_idx == 9);
+    CHECK(heap_pop(&out, h) == HEAP_ERR_EMPTY);
+}
+
+/* Events pushed out of order pop in time order. */
+static void test_heap_orders_by_time(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    const uint64_t times[10] = {50, 10, 90, 30, 70, 20, 80, 40, 60, 0};
+    int push_ok = 1;
+    for (size_t i = 0; i < 10; i++) {
+        Event e = ev_at(times[i], (uint8_t)i);
+        if (heap_push(h, &e) != HEAP_OK) push_ok = 0;
+    }
+    CHECK(push_ok);
+    CHECK(heap_property_holds(h));
+    int sorted = 1;
+    for (uint64_t want = 0; want <= 90; want += 10) {
+        Event out;
+        if (heap_pop(&out, h) != HEAP_OK || out.time != want) sorted = 0;
+        if (!heap_property_holds(h)) sorted = 0;
+    }
+    CHECK(sorted);
+    CHECK(h->size == 0);
+}
+
+/* Events at the same time pop in the order they were pushed. */
+static void test_heap_ties_pop_in_push_order(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    int push_ok = 1;
+    for (uint8_t i = 0; i < 20; i++) {
+        Event e = ev_at(100, i);
+        if (heap_push(h, &e) != HEAP_OK) push_ok = 0;
+    }
+    Event early = ev_at(50, 99);
+    if (heap_push(h, &early) != HEAP_OK) push_ok = 0;
+    CHECK(push_ok);
+
+    Event out;
+    CHECK(heap_pop(&out, h) == HEAP_OK && out.node == 99);
+    int in_order = 1;
+    for (uint8_t i = 0; i < 20; i++) {
+        if (heap_pop(&out, h) != HEAP_OK || out.node != i || out.seq != i) in_order = 0;
+    }
+    CHECK(in_order);
+}
+
+/* The heap assigns seq itself, ignoring whatever the caller put there. */
+static void test_heap_assigns_seq(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    Event e = ev_at(5, 0);
+    e.seq = 12345;
+    CHECK(heap_push(h, &e) == HEAP_OK);
+    e.seq = 0;
+    CHECK(heap_push(h, &e) == HEAP_OK);
+    Event a, b;
+    CHECK(heap_pop(&a, h) == HEAP_OK);
+    CHECK(heap_pop(&b, h) == HEAP_OK);
+    CHECK(a.seq == 0);
+    CHECK(b.seq == 1);
+}
+
+/* seq keeps counting after the heap empties, so it never repeats within a run. */
+static void test_heap_seq_survives_emptying(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    Event e = ev_at(1, 0), out;
+    CHECK(heap_push(h, &e) == HEAP_OK);
+    CHECK(heap_pop(&out, h) == HEAP_OK);
+    CHECK(h->size == 0);
+    CHECK(heap_push(h, &e) == HEAP_OK);
+    CHECK(heap_pop(&out, h) == HEAP_OK);
+    CHECK(out.seq == 1);
+    CHECK(h->next_seq == 2);
+}
+
+/* A full heap rejects a push without changing size or using up a seq, and still drains in order. */
+static void test_heap_full(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    int push_ok = 1;
+    for (size_t i = 0; i < HEAP_CAP; i++) {
+        Event e = ev_at((uint64_t)(HEAP_CAP - i), (uint8_t)i);
+        if (heap_push(h, &e) != HEAP_OK) push_ok = 0;
+    }
+    CHECK(push_ok);
+    CHECK(h->size == HEAP_CAP);
+    CHECK(heap_property_holds(h));
+
+    Event extra = ev_at(0, 0);
+    CHECK(heap_push(h, &extra) == HEAP_ERR_FULL);
+    CHECK(h->size == HEAP_CAP);
+    CHECK(h->next_seq == HEAP_CAP);
+
+    int sorted = 1;
+    uint64_t prev = 0;
+    for (size_t i = 0; i < HEAP_CAP; i++) {
+        Event out;
+        if (heap_pop(&out, h) != HEAP_OK || out.time < prev) sorted = 0;
+        prev = out.time;
+    }
+    CHECK(sorted);
+    CHECK(h->size == 0);
+}
+
+/* Peek on an empty heap fails and leaves the output untouched. */
+static void test_heap_peek_empty(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    Event out = ev_at(7, 7);
+    Event before = out;
+    CHECK(heap_peek(&out, h) == HEAP_ERR_EMPTY);
+    CHECK(memcmp(&out, &before, sizeof(out)) == 0);
+}
+
+/* Peek returns what pop would return, and leaves the heap exactly as it was. */
+static void test_heap_peek_matches_pop(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    const uint64_t times[5] = {30, 10, 50, 20, 40};
+    for (size_t i = 0; i < 5; i++) {
+        Event e = ev_at(times[i], (uint8_t)i);
+        heap_push(h, &e);
+    }
+    size_t size_before = h->size;
+    uint64_t seq_before = h->next_seq;
+    Event first_slot = h->events[0];
+
+    Event peeked, peeked_again, popped;
+    CHECK(heap_peek(&peeked, h) == HEAP_OK);
+    CHECK(heap_peek(&peeked_again, h) == HEAP_OK);
+    CHECK(h->size == size_before);
+    CHECK(h->next_seq == seq_before);
+    CHECK(memcmp(&h->events[0], &first_slot, sizeof(Event)) == 0);
+    CHECK(memcmp(&peeked, &peeked_again, sizeof(Event)) == 0);
+    CHECK(peeked.time == 10);
+
+    CHECK(heap_pop(&popped, h) == HEAP_OK);
+    CHECK(memcmp(&peeked, &popped, sizeof(Event)) == 0);
+    CHECK(heap_peek(&peeked, h) == HEAP_OK);
+    CHECK(peeked.time == 20);
+}
+
+/* 10k random pushes and pops match a simple linear-scan reference queue exactly. */
+static void test_heap_random_ops_match_reference(void) {
+    Heap *h = &test_heap;
+    heap_init(h);
+    static Event ref[HEAP_CAP];
+    size_t ref_len = 0;
+    uint64_t ref_seq = 0;
+    PRNG rng = prng_init(2026);
+
+    int matches = 1, property = 1;
+    for (int op = 0; op < 10000; op++) {
+        int do_push = ref_len == 0 || (ref_len < HEAP_CAP && prng_next(&rng) % 3 != 0);
+        if (do_push) {
+            Event e = ev_at(prng_next(&rng) % 64, (uint8_t)(op & 0xFF));
+            if (heap_push(h, &e) != HEAP_OK) matches = 0;
+            e.seq = ref_seq++;
+            ref[ref_len++] = e;
+        } else {
+            size_t best = 0;
+            for (size_t i = 1; i < ref_len; i++) {
+                if (ev_earlier(&ref[i], &ref[best])) best = i;
+            }
+            Event want = ref[best];
+            ref[best] = ref[--ref_len];
+            Event got;
+            if (heap_pop(&got, h) != HEAP_OK) matches = 0;
+            if (memcmp(&got, &want, sizeof(got)) != 0) matches = 0;
+        }
+        if (h->size != ref_len) matches = 0;
+        if (!heap_property_holds(h)) property = 0;
+    }
+    CHECK(matches);
+    CHECK(property);
+}
+
+/* Mirrors PING_LIMIT in node.c: the last counter a ping-pong node still receives. */
+#define PING_LIMIT_FOR_TESTS 10
+
+/* Two simulators for the sim tests; each is ~1.3 MB, far too big for the stack. */
+static Sim sim_a, sim_b;
+
+/* Encodes a ping-pong counter as its 8-byte message. */
+static void ping_bytes(uint64_t counter, uint8_t out[8]) {
+    Buf b = init_enc_buf(out, 8);
+    put_u64_le(&b, counter);
+}
+
+/* Starts a ping-pong exchange: node 0 sends counter 0 to node 1. */
+static SimResult start_ping(Sim *sim) {
+    uint8_t msg[8];
+    ping_bytes(0, msg);
+    return sim_send(sim, 0, 1, msg, sizeof(msg));
+}
+
+/* init rejects bad node counts and delay ranges, and accepts the boundaries. */
+static void test_sim_init_validation(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 1, 10, 5, 4) == SIM_ERR_BAD_CONFIG);
+    CHECK(sim_init(s, 1, 1, 50, 0) == SIM_ERR_BAD_CONFIG);
+    CHECK(sim_init(s, 1, 1, 50, SIM_MAX_NODES + 1) == SIM_ERR_BAD_CONFIG);
+    CHECK(sim_init(s, 1, 1, (uint64_t)UINT16_MAX + 1, 4) == SIM_ERR_BAD_CONFIG);
+    CHECK(sim_init(s, 1, 1, UINT16_MAX, SIM_MAX_NODES) == SIM_OK);
+    CHECK(sim_init(s, 1, 7, 7, 1) == SIM_OK);
+}
+
+/* A fresh simulator is at time 0, with an empty queue, every slot free, and zeroed counters. */
+static void test_sim_init_state(void) {
+    Sim *s = &sim_a;
+    s->now = 99;
+    s->delivered = 99;
+    s->crashed[3] = 1;
+    CHECK(sim_init(s, 42, 1, 50, 4) == SIM_OK);
+    CHECK(s->now == 0);
+    CHECK(s->n == 4);
+    CHECK(s->heap.size == 0);
+    CHECK(s->free_count == SIM_POOL_CAP);
+    CHECK(s->events_processed == 0);
+    CHECK(s->delivered == 0);
+    CHECK(all_bytes_are(s->crashed, sizeof(s->crashed), 0));
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+}
+
+/* Invalid sends are rejected without using a slot or queueing an event. */
+static void test_sim_send_rejects(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 1, 1, 50, 4) == SIM_OK);
+    uint8_t msg[8] = {0};
+    static uint8_t big[SIM_MSG_MAX + 1];
+    CHECK(sim_send(s, 4, 1, msg, 8) == SIM_ERR_BAD_NODE);
+    CHECK(sim_send(s, 0, 4, msg, 8) == SIM_ERR_BAD_NODE);
+    CHECK(sim_send(s, 0, 1, msg, 0) == SIM_ERR_MSG_LEN_ZERO);
+    CHECK(sim_send(s, 0, 1, big, sizeof(big)) == SIM_ERR_MSG_TOO_LONG);
+    CHECK(sim_send(s, 0, 1, big, SIM_MSG_MAX) == SIM_OK);
+    CHECK(s->free_count == SIM_POOL_CAP - 1);
+    CHECK(s->heap.size == 1);
+}
+
+/* A send copies the bytes into a slot and schedules delivery within the delay range. */
+static void test_sim_send_schedules_delivery(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 5, 10, 20, 4) == SIM_OK);
+    const uint8_t msg[5] = {1, 2, 3, 4, 5};
+    CHECK(sim_send(s, 2, 3, msg, sizeof(msg)) == SIM_OK);
+    Event e;
+    CHECK(heap_peek(&e, &s->heap) == HEAP_OK);
+    CHECK(e.type == EV_DELIVER);
+    CHECK(e.from == 2);
+    CHECK(e.node == 3);
+    CHECK(e.time >= 10 && e.time <= 20);
+    CHECK(s->msg_pool[e.msg_idx].len == 5);
+    CHECK(memcmp(s->msg_pool[e.msg_idx].bytes, msg, 5) == 0);
+}
+
+/* Many sends never draw a delay outside [min, max]. */
+static void test_sim_send_delay_range(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 77, 3, 9, 2) == SIM_OK);
+    uint8_t msg[8];
+    ping_bytes(PING_LIMIT_FOR_TESTS, msg);
+    int in_range = 1, saw_min = 0, saw_max = 0;
+    for (int i = 0; i < 200; i++) {
+        if (sim_send(s, 0, 1, msg, 8) != SIM_OK) in_range = 0;
+    }
+    Event e;
+    while (heap_pop(&e, &s->heap) == HEAP_OK) {
+        if (e.time < 3 || e.time > 9) in_range = 0;
+        if (e.time == 3) saw_min = 1;
+        if (e.time == 9) saw_max = 1;
+    }
+    CHECK(in_range);
+    CHECK(saw_min && saw_max);
+}
+
+/* A full ping-pong exchange delivers every message, ends on an empty queue, and returns every slot. */
+static void test_sim_ping_pong_runs_to_completion(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 123, 1, 50, 2) == SIM_OK);
+    CHECK(start_ping(s) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->delivered == PING_LIMIT_FOR_TESTS + 1);
+    CHECK(s->events_processed == PING_LIMIT_FOR_TESTS + 1);
+    CHECK(s->free_count == SIM_POOL_CAP);
+    CHECK(s->heap.size == 0);
+    CHECK(s->now >= (PING_LIMIT_FOR_TESTS + 1) * 1);
+    CHECK(s->now <= (PING_LIMIT_FOR_TESTS + 1) * 50);
+}
+
+/* With a fixed delay the finishing time is exact: one delay per delivered message. */
+static void test_sim_fixed_delay_exact_time(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 9, 7, 7, 2) == SIM_OK);
+    CHECK(start_ping(s) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->now == 7 * (PING_LIMIT_FOR_TESTS + 1));
+}
+
+/* The same seed gives the same run; a different seed gives different timing. */
+static void test_sim_same_seed_same_run(void) {
+    CHECK(sim_init(&sim_a, 2026, 1, 1000, 2) == SIM_OK);
+    CHECK(sim_init(&sim_b, 2026, 1, 1000, 2) == SIM_OK);
+    CHECK(start_ping(&sim_a) == SIM_OK);
+    CHECK(start_ping(&sim_b) == SIM_OK);
+    CHECK(sim_run(&sim_a, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(sim_run(&sim_b, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(sim_a.now == sim_b.now);
+    CHECK(sim_a.events_processed == sim_b.events_processed);
+    CHECK(sim_a.rng.state == sim_b.rng.state);
+
+    CHECK(sim_init(&sim_b, 2027, 1, 1000, 2) == SIM_OK);
+    CHECK(start_ping(&sim_b) == SIM_OK);
+    CHECK(sim_run(&sim_b, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(sim_a.now != sim_b.now);
+}
+
+/* Stopping at a time limit leaves later events queued, and resuming gives the same result as one long run. */
+static void test_sim_time_limit_and_resume(void) {
+    CHECK(sim_init(&sim_a, 31, 5, 15, 2) == SIM_OK);
+    CHECK(sim_init(&sim_b, 31, 5, 15, 2) == SIM_OK);
+    CHECK(start_ping(&sim_a) == SIM_OK);
+    CHECK(start_ping(&sim_b) == SIM_OK);
+
+    CHECK(sim_run(&sim_a, 40) == SIM_DONE_TIMELIMIT);
+    CHECK(sim_a.now <= 40);
+    CHECK(sim_a.heap.size == 1);
+    Event next;
+    CHECK(heap_peek(&next, &sim_a.heap) == HEAP_OK && next.time > 40);
+    CHECK(sim_run(&sim_a, 40) == SIM_DONE_TIMELIMIT);
+    CHECK(sim_run(&sim_a, 90) == SIM_DONE_TIMELIMIT);
+    CHECK(sim_run(&sim_a, UINT64_MAX) == SIM_DONE_EMPTY);
+
+    CHECK(sim_run(&sim_b, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(sim_a.now == sim_b.now);
+    CHECK(sim_a.delivered == sim_b.delivered);
+    CHECK(sim_a.rng.state == sim_b.rng.state);
+}
+
+/* A message to a crashed node is dropped, but its slot is still returned. */
+static void test_sim_crashed_node_receives_nothing(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 4, 1, 50, 2) == SIM_OK);
+    s->crashed[1] = 1;
+    CHECK(start_ping(s) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->events_processed == 1);
+    CHECK(s->delivered == 0);
+    CHECK(s->free_count == SIM_POOL_CAP);
+}
+
+/* A crash event stops a node mid-run: the exchange ends at the first message it would have received. */
+static void test_sim_crash_event_mid_run(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 8, 10, 10, 2) == SIM_OK);
+    Event crash = {0};
+    crash.type = EV_CRASH;
+    crash.node = 1;
+    crash.time = 25;
+    CHECK(heap_push(&s->heap, &crash) == HEAP_OK);
+    CHECK(start_ping(s) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->crashed[1] == 1);
+    CHECK(s->delivered == 2);
+    CHECK(s->events_processed == 4);
+    CHECK(s->now == 30);
+    CHECK(s->free_count == SIM_POOL_CAP);
+}
+
+/* Timers fire at exactly now + delay, in time order, and bad node ids are rejected. */
+static void test_sim_timers(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 1, 1, 50, 3) == SIM_OK);
+    CHECK(sim_set_timer(s, 3, 10) == SIM_ERR_BAD_NODE);
+    CHECK(sim_set_timer(s, 0, 300) == SIM_OK);
+    CHECK(sim_set_timer(s, 1, 100) == SIM_OK);
+    CHECK(sim_set_timer(s, 2, 200) == SIM_OK);
+    CHECK(s->free_count == SIM_POOL_CAP);
+
+    CHECK(sim_run(s, 150) == SIM_DONE_TIMELIMIT);
+    CHECK(s->now == 100);
+    CHECK(s->events_processed == 1);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->now == 300);
+    CHECK(s->events_processed == 3);
+    CHECK(s->delivered == 0);
+}
+
+/* The pool runs out after SIM_POOL_CAP in-flight messages, and delivering them frees every slot. */
+static void test_sim_pool_full(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 3, 1, 50, 2) == SIM_OK);
+    uint8_t msg[8];
+    ping_bytes(PING_LIMIT_FOR_TESTS, msg);
+    int all_ok = 1;
+    for (int i = 0; i < SIM_POOL_CAP; i++) {
+        if (sim_send(s, 0, 1, msg, 8) != SIM_OK) all_ok = 0;
+    }
+    CHECK(all_ok);
+    CHECK(s->free_count == 0);
+    CHECK(sim_send(s, 0, 1, msg, 8) == SIM_ERR_POOL_FULL);
+    CHECK(s->heap.size == SIM_POOL_CAP);
+
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->delivered == SIM_POOL_CAP);
+    CHECK(s->free_count == SIM_POOL_CAP);
+}
+
+/* When the event queue is full, a send fails and gives its slot back. */
+static void test_sim_heap_full_returns_slot(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 3, 1, 50, 2) == SIM_OK);
+    int all_ok = 1;
+    for (int i = 0; i < HEAP_CAP; i++) {
+        if (sim_set_timer(s, 0, (uint64_t)i) != SIM_OK) all_ok = 0;
+    }
+    CHECK(all_ok);
+    CHECK(sim_set_timer(s, 0, 1) == SIM_ERR_HEAP_FULL);
+    uint8_t msg[8] = {0};
+    CHECK(sim_send(s, 0, 1, msg, 8) == SIM_ERR_HEAP_FULL);
+    CHECK(s->free_count == SIM_POOL_CAP);
+}
+
+/* A malformed message stops the run with an error, without leaking its slot. */
+static void test_sim_bad_message_stops_run(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 3, 1, 50, 2) == SIM_OK);
+    const uint8_t short_msg[3] = {1, 2, 3};
+    CHECK(sim_send(s, 0, 1, short_msg, sizeof(short_msg)) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_ERR_BAD_MSG);
+    CHECK(s->free_count == SIM_POOL_CAP);
 }
 
 int main(void) {
@@ -1564,8 +2219,11 @@ int main(void) {
     test_tx_encode_full();
     test_tx_encode_full_rolls_back_to_start();
     test_tx_decode_every_prefix_truncated();
+    test_tx_decode_failure_keeps_earlier_progress();
     test_tx_decode_does_not_verify();
     test_block_encode_layout();
+    test_block_full_width_fields();
+    test_chain_past_255_blocks();
     test_block_encode_excludes_hash();
     test_block_hash_is_hash_of_encoding();
     test_block_roundtrip();
@@ -1573,8 +2231,45 @@ int main(void) {
     test_block_encode_full();
     test_block_encode_full_rolls_back_to_start();
     test_block_decode_every_prefix_truncated();
+    test_block_decode_failure_keeps_earlier_progress();
     test_decode_random_bytes();
     test_tx_block_result_str();
+
+    test_prng_init();
+    test_prng_reference_seed_0();
+    test_prng_reference_seed_1234567();
+    test_prng_state_is_counter();
+    test_prng_same_seed_same_sequence();
+    test_prng_independent_streams();
+    test_prng_no_short_repeats();
+
+    test_heap_init();
+    test_heap_pop_empty();
+    test_heap_single();
+    test_heap_orders_by_time();
+    test_heap_ties_pop_in_push_order();
+    test_heap_assigns_seq();
+    test_heap_seq_survives_emptying();
+    test_heap_full();
+    test_heap_peek_empty();
+    test_heap_peek_matches_pop();
+    test_heap_random_ops_match_reference();
+
+    test_sim_init_validation();
+    test_sim_init_state();
+    test_sim_send_rejects();
+    test_sim_send_schedules_delivery();
+    test_sim_send_delay_range();
+    test_sim_ping_pong_runs_to_completion();
+    test_sim_fixed_delay_exact_time();
+    test_sim_same_seed_same_run();
+    test_sim_time_limit_and_resume();
+    test_sim_crashed_node_receives_nothing();
+    test_sim_crash_event_mid_run();
+    test_sim_timers();
+    test_sim_pool_full();
+    test_sim_heap_full_returns_slot();
+    test_sim_bad_message_stops_run();
 
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures != 0;

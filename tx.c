@@ -49,12 +49,19 @@ fail:
 }
 
 TxResult tx_decode(Tx *out, Reader *r) {
-    if(get_bytes(out->from, r, crypto_sign_PUBLICKEYBYTES)) return TX_ERR_TRUNCATED;
-    if(get_bytes(out->to, r, crypto_sign_PUBLICKEYBYTES)) return TX_ERR_TRUNCATED;
-    if(get_u64_le(&out->amount, r)) return TX_ERR_TRUNCATED;
-    if(get_u64_le(&out->nonce, r)) return TX_ERR_TRUNCATED;
-    if(get_bytes(out->sig, r, crypto_sign_BYTES)) return TX_ERR_TRUNCATED;
+    Tx temp = {0};
+    size_t offset = r->offset;
+    if(get_bytes(temp.from, r, crypto_sign_PUBLICKEYBYTES)) goto fail;
+    if(get_bytes(temp.to, r, crypto_sign_PUBLICKEYBYTES)) goto fail;
+    if(get_u64_le(&temp.amount, r)) goto fail;
+    if(get_u64_le(&temp.nonce, r)) goto fail;
+    if(get_bytes(temp.sig, r, crypto_sign_BYTES)) goto fail;
+    *out = temp;
     return TX_OK;
+
+fail:
+    r->offset = offset;
+    return TX_ERR_TRUNCATED;
 }
 
 /* Returns a human-readable name for a tx result, for logs and test output. */
