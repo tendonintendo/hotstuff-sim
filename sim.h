@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "event.h"
 #include "prng.h"
+#include "node_state.h"
 
 #define SIM_MAX_NODES 32
 #define SIM_MSG_MAX 4800
@@ -26,7 +27,8 @@ typedef enum{
     SIM_ERR_TIMER,
     SIM_ERR_TIME_BACKWARDS,
     SIM_ERR_MSG_LEN_ZERO,
-    SIM_ERR_BAD_MSG
+    SIM_ERR_BAD_MSG,
+    SIM_ERR_BAD_BLOCK
 } SimResult;
 
 typedef struct{
@@ -47,6 +49,7 @@ typedef struct{
     uint64_t delay_max;
     uint64_t events_processed;
     uint64_t delivered;
+    Node nodes[SIM_MAX_NODES];
 } Sim;
 
 SimResult sim_init(Sim *sim, const uint64_t seed, const uint64_t delay_min, const uint64_t delay_max, const size_t n);
