@@ -14,7 +14,35 @@ day 2: transactions and signatures, merkle trees, and state
 - writing byte by byte in loop for uint byte difference. endianness
 - macros need outer parentheses to reduce risk of bugs
 - carry over odd nodes to i / 2 to achieve H(H(ab)|H(c)) as opposed to H(H(ab) | H(cc)). duplicating the last leaf when nodes are odd causes [a,b,c] and [a,b,c,c] to get the same root (CVE-2012-2459)
-- nonce avoids replay attacks (the same transaction being ran multiple times) and state_apply_tx will only accept when tx.nonce == account.nonce. nonce is covered by the signature and thus cannot be forged
+- nonce avoids replay attacks (the same transaction being ran multiple times) and state_apply_tx will only accept when tx.nonce == account.nonce. nonce is covered by the signature and thus cannot be forged, sign everything except for the sig itself
 - domain separation, add distinct byte prefixes (0x00 for leaves and 0x01 for nodes) to hash so that each hash has its own roles. without it an internal node can be passed of as a leaf, which forges a Merkle proof.
 
-day 3: encoding
+day 3: encoding and simulator core
+- bounds check as n > cap - len, not len + n > cap. the addition can wrap around and pass the check, the subtraction can't since len <= cap
+- encode/decode is all or nothing: on failure restore len/offset and leave the output untouched. decode into a local and copy out only on success. goto fail keeps one cleanup path, and the success path must return before the label or it falls through into it
+- the block hash is not encoded since it's derived. decode recomputes it, otherwise a decoded block could carry a hash that doesn't match its contents
+- widen counters and indices to uint64_t. uint8_t index or seq wraps after 255 and silently breaks ordering
+- start accumulators at 0 and don't |= into an old value
+- splitmix64: the state is just a counter (+= golden ratio constant), the output is a mixed copy of it.
+- event heap is a min heap ordered by (time, seq). seq is assigned by the heap on push and breaks ties so equal time events always come out in the same order
+- peek before pop when stopping at a time limit, so the next event stays in the heap and a resumed run is identical
+- message pool with a free slot stack gives O(1) alloc/free, no malloc and no globals so it can move to the GPU later. return the slot after every delivery, even to a crashed node
+- dispatch with switch, not function pointers (GPU constraint), so node handlers are linked in instead of registered
+- order struct fields largest first to avoid padding
+
+day 4: cuda warm-up (vector add) and gpu block hashing
+- __global__ runs on GPU and is launched from host with kernel<<<blocks, threads>>>(...), __device__ runs on GPU and is called from GPU code, __host__ is the default
+- device pointers are not valid on the host and host pointers are not valid on the device. prefix them h_ and d_ so passing the wrong one stands out
+- a kernel launch is async and returns nothing. check cudaGetLastError() right after the launch and cudaDeviceSynchronize() after that, or errors go unnoticed
+- max 1024 threads per block, asking for 2048 gives invalid configuration argument and the kernel never runs. the grid (number of blocks) can be huge
+- cast blockIdx.x to size_t before multiplying, otherwise the index is computed in 32 bits and overflows for large grids
+- main must return nonzero on failure so scripts and make can tell. an uninitialised status variable returns garbage on the success path
+- linear buffers: n records of fixed length L live back to back in one flat buffer, record i starts at buf + i * L. it's the same layout as a 2D array buf[n][L]. arithmetic on a uint8_t * counts bytes, so the stride is in bytes
+- one thread per record, each thread only touches its own slice, so no races, no locks and the output lines up index for index with the CPU loop
+- device functions must be defined in the header (static __device__)
+- __device__ marks a function that is compiled for the GPU and can only be called from GPU code (kernels or other __device__ functions), never from the host. each thread runs it as ordinary serial code on its own data, no thread index needed
+- nvcc compiles device code per .cu file and can't link a __device__ call to another file without -rdc=true, so the bodies live in the .cuh and get pasted into every .cu that includes it. static gives each .cu its own private copy so two includers don't clash
+- __constant__ arrays are zero filled without an initializer
+- extern "C" stops C++ name mangling so gcc objects can link against nvcc objects. wrap only extern "C" { } in #ifdef __cplusplus
+- library code returns an error instead of exit(). goto fail with every device pointer starting as NULL works because cudaFree(NULL) is a no-op
+- SHA-256 is big-endian (message words, length, digest), opposite of our encoding. the length in the padding is in bits, not bytes
