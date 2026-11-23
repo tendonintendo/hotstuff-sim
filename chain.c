@@ -22,7 +22,7 @@ ChainResult chain_append(Chain *bc, const Tx txs[MAX_TXS], size_t cnt) {
             bc->cap = bc->cap << 1;
         } else return CHAIN_ERR_NOMEM;
     }
-    if(make_block(&bc->blocks[bc->len - 1], txs, cnt, &bc->blocks[bc->len]) != BLOCK_OK) {
+    if(make_block(&bc->blocks[bc->len - 1], txs, cnt, bc->blocks[bc->len - 1].timestamp + 1, &bc->blocks[bc->len]) != BLOCK_OK) {
         return CHAIN_ERR_BAD_BLOCK;
     }
     bc->len++;
@@ -41,11 +41,8 @@ ChainResult validate_chain(const Chain *bc) {
     uint8_t buf[HASH_LEN];
 
     for(int i = bc->len - 1; i > 0; i--) {
-        compute_hash(&bc->blocks[i], buf);
-
-        if(memcmp(bc->blocks[i].prev_hash, bc->blocks[i-1].hash, HASH_LEN)) return CHAIN_ERR_BAD_LINK;
-        if(bc->blocks[i].index != bc->blocks[i - 1].index + 1) return CHAIN_ERR_BAD_INDEX;
-        if(memcmp(bc->blocks[i].hash, buf, HASH_LEN)) return CHAIN_ERR_BAD_HASH;
+        ChainResult t = chain_check_next(&bc->blocks[i - 1], &bc->blocks[i]);
+        if(t != CHAIN_OK) return t;
     }
 
     compute_hash(&bc->blocks[0], buf);
@@ -71,4 +68,15 @@ const char *chain_result_str(ChainResult result) {
     case CHAIN_ERR_BAD_BLOCK:   return "block could not be built";
     }
     return "unknown result";
+}
+
+ChainResult chain_check_next(const Block *prev, const Block *b) {
+    if(memcmp(b->prev_hash, prev->hash, HASH_LEN)) return CHAIN_ERR_BAD_LINK;
+    if(b->index != prev->index + 1) return CHAIN_ERR_BAD_INDEX;
+    uint8_t buf[HASH_LEN];
+    compute_hash(b, buf);
+
+    if(memcmp(b->hash, buf, HASH_LEN)) return CHAIN_ERR_BAD_HASH;
+
+    return CHAIN_OK;
 }

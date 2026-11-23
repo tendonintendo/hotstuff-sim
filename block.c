@@ -1,7 +1,6 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include "helpers.h"
 #include "block.h"
 #include "merkle.h"
@@ -18,15 +17,15 @@ void compute_hash(const Block *block, uint8_t* output) {
 
 Block create_genesis_block(void) {
     Block genesis = {0};
-    genesis.timestamp = time(NULL);
+    genesis.timestamp = 0;
     compute_hash(&genesis, genesis.hash);
     return genesis;
 }
 
-BlockResult make_block(const Block *prev, const Tx txs[MAX_TXS], const size_t cnt, Block *out) {
+BlockResult make_block(const Block *prev, const Tx txs[MAX_TXS], const size_t cnt, const uint64_t timestamp, Block *out) {
     if(cnt > MAX_TXS) return BLOCK_ERR_TOO_MANY_TXS;
     Block next = {0};
-    next.timestamp = time(NULL) + prev->index + 1;
+    next.timestamp = timestamp;
     next.index = prev->index + 1;
     memcpy(next.prev_hash, prev->hash, HASH_LEN);
     uint8_t tx_hashes[MERKLE_MAX_LEAVES][HASH_LEN];
