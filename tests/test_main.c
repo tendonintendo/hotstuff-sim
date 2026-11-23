@@ -10,6 +10,7 @@
 #include "../prng.h"
 #include "../event.h"
 #include "../sim.h"
+#include "../node.h"
 
 static int checks = 0;
 static int failures = 0;
@@ -47,6 +48,14 @@ static void test_hash_deterministic(void) {
     compute_hash(&b, h1);
     compute_hash(&b, h2);
     CHECK(memcmp(h1, h2, HASH_LEN) == 0);
+}
+
+/* Every node builds the same genesis: fixed timestamp 0, so two calls give identical blocks. */
+static void test_genesis_identical_across_calls(void) {
+    Block a = create_genesis_block();
+    Block b = create_genesis_block();
+    CHECK(a.timestamp == 0);
+    CHECK(memcmp(a.hash, b.hash, HASH_LEN) == 0);
 }
 
 /* Changing any single header field changes the digest. */
@@ -809,10 +818,11 @@ static void test_make_block_with_txs(void) {
     make_txs(txs, 5, &alice, &bob);
     expected_tx_root(txs, 5, want);
 
-    CHECK(make_block(&genesis, txs, 5, &b) == BLOCK_OK);
+    CHECK(make_block(&genesis, txs, 5, 77, &b) == BLOCK_OK);
     CHECK(memcmp(b.tx_root, want, HASH_LEN) == 0);
     CHECK(memcmp(b.prev_hash, genesis.hash, HASH_LEN) == 0);
     CHECK(b.index == 1);
+    CHECK(b.timestamp == 77);
     compute_hash(&b, h);
     CHECK(memcmp(b.hash, h, HASH_LEN) == 0);
 }
@@ -821,7 +831,7 @@ static void test_make_block_with_txs(void) {
 static void test_make_block_empty(void) {
     Block genesis = create_genesis_block(), b;
     uint8_t zero[HASH_LEN] = {0};
-    CHECK(make_block(&genesis, NULL, 0, &b) == BLOCK_OK);
+    CHECK(make_block(&genesis, NULL, 0, 1, &b) == BLOCK_OK);
     CHECK(memcmp(b.tx_root, zero, HASH_LEN) == 0);
 }
 
@@ -831,7 +841,7 @@ static void test_make_block_too_many(void) {
     Block genesis = create_genesis_block(), b, before;
     memset(&b, 0xab, sizeof(b));
     before = b;
-    CHECK(make_block(&genesis, txs, MAX_TXS + 1, &b) == BLOCK_ERR_TOO_MANY_TXS);
+    CHECK(make_block(&genesis, txs, MAX_TXS + 1, 1, &b) == BLOCK_ERR_TOO_MANY_TXS);
     CHECK(memcmp(&b, &before, sizeof(Block)) == 0);
 }
 
@@ -841,9 +851,9 @@ static void test_tx_change_changes_block_hash(void) {
     Tx txs[MAX_TXS];
     Block genesis = create_genesis_block(), a, b;
     make_txs(txs, 4, &alice, &bob);
-    make_block(&genesis, txs, 4, &a);
+    make_block(&genesis, txs, 4, 1, &a);
     txs[2] = signed_tx_nonce(&alice, &bob, 999, 2);
-    make_block(&genesis, txs, 4, &b);
+    make_block(&genesis, txs, 4, 1, &b);
     CHECK(memcmp(a.tx_root, b.tx_root, HASH_LEN) != 0);
     CHECK(memcmp(a.hash, b.hash, HASH_LEN) != 0);
 }
@@ -1405,7 +1415,7 @@ static void test_block_roundtrip(void) {
     make_txs(txs, 5, &alice, &bob);
     Block genesis = create_genesis_block();
     Block blk;
-    CHECK(make_block(&genesis, txs, 5, &blk) == BLOCK_OK);
+    CHECK(make_block(&genesis, txs, 5, 1, &blk) == BLOCK_OK);
 
     uint8_t storage[BLOCK_HEADER_LEN];
     Buf b = init_enc_buf(storage, sizeof(storage));
@@ -1869,18 +1879,20 @@ static void test_heap_random_ops_match_reference(void) {
 /* Mirrors PING_LIMIT in node.c: the last counter a ping-pong node still receives. */
 #define PING_LIMIT_FOR_TESTS 10
 
-/* Two simulators for the sim tests; each is ~1.3 MB, far too big for the stack. */
+/* Two simulators for the sim tests; each is ~1.8 MB, far too big for the stack. */
 static Sim sim_a, sim_b;
 
-/* Encodes a ping-pong counter as its 8-byte message. */
-static void ping_bytes(uint64_t counter, uint8_t out[8]) {
-    Buf b = init_enc_buf(out, 8);
+/* Encodes a ping-pong counter as its tagged message: MSG_PING, then the u64 counter. */
+static void ping_bytes(uint64_t counter, uint8_t out[MSG_PING_LEN]) {
+    Buf b = init_enc_buf(out, MSG_PING_LEN);
+    uint8_t tag = MSG_PING;
+    put_bytes(&b, &tag, MSG_TAG_LEN);
     put_u64_le(&b, counter);
 }
 
 /* Starts a ping-pong exchange: node 0 sends counter 0 to node 1. */
 static SimResult start_ping(Sim *sim) {
-    uint8_t msg[8];
+    uint8_t msg[MSG_PING_LEN];
     ping_bytes(0, msg);
     return sim_send(sim, 0, 1, msg, sizeof(msg));
 }
@@ -1948,11 +1960,11 @@ static void test_sim_send_schedules_delivery(void) {
 static void test_sim_send_delay_range(void) {
     Sim *s = &sim_a;
     CHECK(sim_init(s, 77, 3, 9, 2) == SIM_OK);
-    uint8_t msg[8];
+    uint8_t msg[MSG_PING_LEN];
     ping_bytes(PING_LIMIT_FOR_TESTS, msg);
     int in_range = 1, saw_min = 0, saw_max = 0;
     for (int i = 0; i < 200; i++) {
-        if (sim_send(s, 0, 1, msg, 8) != SIM_OK) in_range = 0;
+        if (sim_send(s, 0, 1, msg, MSG_PING_LEN) != SIM_OK) in_range = 0;
     }
     Event e;
     while (heap_pop(&e, &s->heap) == HEAP_OK) {
@@ -2060,9 +2072,9 @@ static void test_sim_crash_event_mid_run(void) {
 /* Timers fire at exactly now + delay, in time order, and bad node ids are rejected. */
 static void test_sim_timers(void) {
     Sim *s = &sim_a;
-    CHECK(sim_init(s, 1, 1, 50, 3) == SIM_OK);
-    CHECK(sim_set_timer(s, 3, 10) == SIM_ERR_BAD_NODE);
-    CHECK(sim_set_timer(s, 0, 300) == SIM_OK);
+    CHECK(sim_init(s, 1, 1, 50, 4) == SIM_OK);
+    CHECK(sim_set_timer(s, 4, 10) == SIM_ERR_BAD_NODE);
+    CHECK(sim_set_timer(s, 3, 300) == SIM_OK);
     CHECK(sim_set_timer(s, 1, 100) == SIM_OK);
     CHECK(sim_set_timer(s, 2, 200) == SIM_OK);
     CHECK(s->free_count == SIM_POOL_CAP);
@@ -2080,15 +2092,15 @@ static void test_sim_timers(void) {
 static void test_sim_pool_full(void) {
     Sim *s = &sim_a;
     CHECK(sim_init(s, 3, 1, 50, 2) == SIM_OK);
-    uint8_t msg[8];
+    uint8_t msg[MSG_PING_LEN];
     ping_bytes(PING_LIMIT_FOR_TESTS, msg);
     int all_ok = 1;
     for (int i = 0; i < SIM_POOL_CAP; i++) {
-        if (sim_send(s, 0, 1, msg, 8) != SIM_OK) all_ok = 0;
+        if (sim_send(s, 0, 1, msg, MSG_PING_LEN) != SIM_OK) all_ok = 0;
     }
     CHECK(all_ok);
     CHECK(s->free_count == 0);
-    CHECK(sim_send(s, 0, 1, msg, 8) == SIM_ERR_POOL_FULL);
+    CHECK(sim_send(s, 0, 1, msg, MSG_PING_LEN) == SIM_ERR_POOL_FULL);
     CHECK(s->heap.size == SIM_POOL_CAP);
 
     CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
@@ -2121,12 +2133,183 @@ static void test_sim_bad_message_stops_run(void) {
     CHECK(s->free_count == SIM_POOL_CAP);
 }
 
+/* Number of proposals in the Day 8 run: node 0 proposes every NODE_PROPOSE_INTERVAL. */
+#define DAY8_PROPOSALS 100
+
+/* Encodes a block as a tagged MSG_PROPOSE message. */
+static size_t propose_bytes(const Block *b, uint8_t out[MSG_PROPOSE_LEN]) {
+    Buf buf = init_enc_buf(out, MSG_PROPOSE_LEN);
+    uint8_t tag = MSG_PROPOSE;
+    put_bytes(&buf, &tag, MSG_TAG_LEN);
+    block_encode(&buf, b);
+    return buf.len;
+}
+
+/* Sets up n nodes on a fresh simulator: sim_init, then node_init for every node. */
+static int start_nodes(Sim *s, uint64_t seed, size_t n) {
+    if (sim_init(s, seed, 1, 50, n) != SIM_OK) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (node_init(s, (uint8_t)i) != SIM_OK) return 0;
+    }
+    return 1;
+}
+
+/* Every block of a node's chain links to the one before it. */
+static int node_chain_valid(const Node *node) {
+    for (size_t i = 1; i < node->len; i++) {
+        if (chain_check_next(&node->blocks[i - 1], &node->blocks[i]) != CHAIN_OK) return 0;
+    }
+    return 1;
+}
+
+/* node_init gives every node the genesis, arms only the leader's timer, and rejects bad ids. */
+static void test_node_init(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 1, 1, 50, 4) == SIM_OK);
+    CHECK(node_init(s, 4) == SIM_ERR_BAD_NODE);
+    for (uint8_t i = 0; i < 4; i++) CHECK(node_init(s, i) == SIM_OK);
+    Block genesis = create_genesis_block();
+    for (int i = 0; i < 4; i++) {
+        CHECK(s->nodes[i].len == 1);
+        CHECK(s->nodes[i].rejected == 0);
+        CHECK(memcmp(s->nodes[i].blocks[0].hash, genesis.hash, HASH_LEN) == 0);
+    }
+    CHECK(s->heap.size == 1);
+    Event e;
+    CHECK(heap_peek(&e, &s->heap) == HEAP_OK);
+    CHECK(e.type == EV_TIMER);
+    CHECK(e.node == NODE_LEADER);
+    CHECK(e.time == NODE_PROPOSE_INTERVAL);
+}
+
+/* Day 8 done check: 4 nodes, 100 proposals, every node ends with 101 blocks and the same tip. */
+static void test_leader_appends_identical_tips(void) {
+    Sim *s = &sim_a;
+    CHECK(start_nodes(s, 2026, 4));
+    CHECK(sim_run(s, NODE_PROPOSE_INTERVAL * DAY8_PROPOSALS + 50) == SIM_DONE_TIMELIMIT);
+    const Node *leader = &s->nodes[NODE_LEADER];
+    CHECK(leader->len == DAY8_PROPOSALS + 1);
+    for (int i = 0; i < 4; i++) {
+        const Node *node = &s->nodes[i];
+        CHECK(node->len == DAY8_PROPOSALS + 1);
+        CHECK(node->rejected == 0);
+        CHECK(node_chain_valid(node));
+        CHECK(memcmp(node->blocks[node->len - 1].hash, leader->blocks[leader->len - 1].hash, HASH_LEN) == 0);
+    }
+    CHECK(s->free_count == SIM_POOL_CAP);
+}
+
+/* Block k carries simulated time k * NODE_PROPOSE_INTERVAL as its timestamp, never wall-clock time. */
+static void test_leader_timestamps_are_sim_time(void) {
+    Sim *s = &sim_a;
+    CHECK(start_nodes(s, 5, 4));
+    CHECK(sim_run(s, NODE_PROPOSE_INTERVAL * 10 + 50) == SIM_DONE_TIMELIMIT);
+    const Node *leader = &s->nodes[NODE_LEADER];
+    CHECK(leader->len == 11);
+    int all_match = 1;
+    for (size_t k = 1; k < leader->len; k++) {
+        if (leader->blocks[k].timestamp != k * NODE_PROPOSE_INTERVAL) all_match = 0;
+    }
+    CHECK(all_match);
+}
+
+/* Different seeds change delivery times but never the outcome; the same seed gives the same tip. */
+static void test_leader_appends_across_seeds(void) {
+    int all_ok = 1;
+    uint8_t first_tip[HASH_LEN];
+    for (uint64_t seed = 1; seed <= 20; seed++) {
+        Sim *s = &sim_a;
+        if (!start_nodes(s, seed, 4)) { all_ok = 0; continue; }
+        if (sim_run(s, NODE_PROPOSE_INTERVAL * 20 + 50) != SIM_DONE_TIMELIMIT) all_ok = 0;
+        for (int i = 0; i < 4; i++) {
+            const Node *node = &s->nodes[i];
+            if (node->len != 21 || node->rejected != 0) all_ok = 0;
+        }
+        const Node *leader = &s->nodes[NODE_LEADER];
+        if (seed == 1) memcpy(first_tip, leader->blocks[leader->len - 1].hash, HASH_LEN);
+        else if (memcmp(first_tip, leader->blocks[leader->len - 1].hash, HASH_LEN) != 0) all_ok = 0;
+    }
+    CHECK(all_ok);
+}
+
+/* When the leader's chain is full it stops proposing, and the run drains to empty. */
+static void test_leader_stops_when_full(void) {
+    Sim *s = &sim_a;
+    CHECK(start_nodes(s, 9, 4));
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    for (int i = 0; i < 4; i++) {
+        CHECK(s->nodes[i].len == NODE_MAX_BLOCKS);
+        CHECK(s->nodes[i].rejected == 0);
+    }
+    CHECK(s->free_count == SIM_POOL_CAP);
+}
+
+/* A follower drops, without stopping the run, a proposal from a non-leader. */
+static void test_follower_rejects_non_leader(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 1, 1, 50, 4) == SIM_OK);
+    for (uint8_t i = 0; i < 4; i++) CHECK(node_init(s, i) == SIM_OK);
+    Block next;
+    CHECK(make_block(&s->nodes[2].blocks[0], NULL, 0, 1, &next) == BLOCK_OK);
+    uint8_t msg[MSG_PROPOSE_LEN];
+    size_t len = propose_bytes(&next, msg);
+    CHECK(sim_send(s, 2, 1, msg, len) == SIM_OK);
+    CHECK(sim_run(s, NODE_PROPOSE_INTERVAL - 1) == SIM_DONE_TIMELIMIT);
+    CHECK(s->nodes[1].len == 1);
+    CHECK(s->nodes[1].rejected == 1);
+}
+
+/* A follower drops a proposal that does not extend its tip: a replayed block and a skipped index. */
+static void test_follower_rejects_bad_link(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 1, 1, 50, 2) == SIM_OK);
+    CHECK(node_init(s, 1) == SIM_OK);
+    Block b1, b2;
+    CHECK(make_block(&s->nodes[1].blocks[0], NULL, 0, 1, &b1) == BLOCK_OK);
+    CHECK(make_block(&b1, NULL, 0, 2, &b2) == BLOCK_OK);
+    uint8_t msg[MSG_PROPOSE_LEN];
+
+    size_t len = propose_bytes(&b2, msg);
+    CHECK(sim_send(s, NODE_LEADER, 1, msg, len) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->nodes[1].len == 1);
+    CHECK(s->nodes[1].rejected == 1);
+
+    len = propose_bytes(&b1, msg);
+    CHECK(sim_send(s, NODE_LEADER, 1, msg, len) == SIM_OK);
+    CHECK(sim_send(s, NODE_LEADER, 1, msg, len) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->nodes[1].len == 2);
+    CHECK(s->nodes[1].rejected == 2);
+}
+
+/* Truncated, oversized and unknown-tag messages are counted as rejected and never abort the run. */
+static void test_follower_rejects_malformed(void) {
+    Sim *s = &sim_a;
+    CHECK(sim_init(s, 1, 1, 50, 2) == SIM_OK);
+    CHECK(node_init(s, 1) == SIM_OK);
+    Block b1;
+    CHECK(make_block(&s->nodes[1].blocks[0], NULL, 0, 1, &b1) == BLOCK_OK);
+    uint8_t msg[MSG_PROPOSE_LEN + 1] = {0};
+    size_t len = propose_bytes(&b1, msg);
+
+    CHECK(sim_send(s, NODE_LEADER, 1, msg, len - 1) == SIM_OK);
+    CHECK(sim_send(s, NODE_LEADER, 1, msg, len + 1) == SIM_OK);
+    const uint8_t unknown[4] = {0x7f, 1, 2, 3};
+    CHECK(sim_send(s, NODE_LEADER, 1, unknown, sizeof(unknown)) == SIM_OK);
+    CHECK(sim_run(s, UINT64_MAX) == SIM_DONE_EMPTY);
+    CHECK(s->nodes[1].len == 1);
+    CHECK(s->nodes[1].rejected == 3);
+    CHECK(s->free_count == SIM_POOL_CAP);
+}
+
 int main(void) {
     if(sodium_init() == -1) {
         printf("ERROR: SODIUM INIT FAILURE\n");
         return -1;
     }
     test_hash_deterministic();
+    test_genesis_identical_across_calls();
     test_hash_covers_every_field();
     test_init();
     test_growth();
@@ -2270,6 +2453,14 @@ int main(void) {
     test_sim_pool_full();
     test_sim_heap_full_returns_slot();
     test_sim_bad_message_stops_run();
+    test_node_init();
+    test_leader_appends_identical_tips();
+    test_leader_timestamps_are_sim_time();
+    test_leader_appends_across_seeds();
+    test_leader_stops_when_full();
+    test_follower_rejects_non_leader();
+    test_follower_rejects_bad_link();
+    test_follower_rejects_malformed();
 
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures != 0;
