@@ -24,5 +24,6 @@ ChainResult chain_append(Chain *bc, const Tx txs[MAX_TXS], size_t cnt);
 void chain_free(Chain *bc);
 ChainResult validate_chain(const Chain *bc);
 const char *chain_result_str(ChainResult result);
+ChainResult chain_check_next(const Block *prev, const Block *b);
 
 #endif
