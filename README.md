@@ -7,6 +7,7 @@ Learning distributed consensus the hard way: I'm implementing chained [HotStuff]
 - [x] Transactions and signatures
 - [x] Merkle trees
 - [x] Binary encoding
-- [ ] Deterministic network simulator
+- [x] Discrete-event simulator core: seeded PRNG, event heap, message delivery, timers and crashes
+- [x] GPU SHA-256 in CUDA, hashing block headers in parallel and checked against the CPU
 - [ ] HotStuff consensus
 - [ ] Safety checker, fault injection and experiments
